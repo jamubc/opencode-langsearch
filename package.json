@@ -1,0 +1,76 @@
+{
+  "name": "@jamubc/opencode-langsearch",
+  "version": "0.1.0",
+  "description": "Unofficial OpenCode plugin that adds LangSearch as a web search provider, optionally as the default engine.",
+  "type": "module",
+  "license": "MIT",
+  "author": "jamubc",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jamubc/opencode-langsearch.git"
+  },
+  "homepage": "https://github.com/jamubc/opencode-langsearch#readme",
+  "bugs": {
+    "url": "https://github.com/jamubc/opencode-langsearch/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "websearch",
+    "search",
+    "langsearch",
+    "jev",
+    "typesafe",
+    "system-one",
+    "prompt-injection",
+    "plugin"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "default": "./dist/tui.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts src/tui.tsx --outdir dist --target node --format esm --sourcemap --external @opencode/plugin --external @opentui/* --external solid-js --external solid-js/*",
+    "build:types": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test",
+    "prepack": "bun run build && bun run build:types"
+  },
+  "dependencies": {
+    "@opencode/plugin": "^2.0.0"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.5.10",
+    "@opentui/solid": ">=0.5.10",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": { "optional": true },
+    "@opentui/solid": { "optional": true },
+    "solid-js": { "optional": true }
+  },
+  "devDependencies": {
+    "@opentui/core": "^0.5.11",
+    "@opentui/solid": "^0.5.11",
+    "@types/bun": "latest",
+    "solid-js": "1.9.12",
+    "typescript": "^5.9.0"
+  }
+}
