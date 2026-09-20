@@ -9,25 +9,21 @@ import plugin, {
   resolveTrimThreshold,
   splitPassages,
   trimResults,
-  DEFAULT_DISAGREEMENT_THRESHOLD,
   DEFAULT_GATE_ENDPOINT,
   DEFAULT_GATE_MODEL,
   DEFAULT_MIN_CONTAINMENT,
-  DISAGREEMENT_NOTE,
   ENDPOINT,
   MIN_SHINGLES,
   OBSERVED_CONTAINMENT_GAP,
   PROVIDER_ID,
   PROVIDER_NAME,
   TRACE_METADATA_KEY,
-  annotateToolContent,
   annotateToolMetadata,
   buildGateRequest,
   buildTrace,
   buildVerboseRecord,
   canonicalizeUrl,
   containment,
-  createNoteStore,
   createPendingStore,
   createTraceFileWriter,
   createTraceStore,
@@ -40,20 +36,26 @@ import plugin, {
   resolveGateThresholds,
   toJsonSafe,
   resolveApiKey,
-  resolveDisagreementThreshold,
   resolveGateApiKey,
   runGate,
   searchLangSearch,
   shingles,
   parsePublished,
-  resolveRecency,
   ageInDays,
   withDateline,
 } from "../src/index"
-import type { GateCollector, LangSearchOptions, LangSearchResult, SearchTrace } from "../src/index"
+import type { GateCollector, GateDecision, LangSearchOptions, LangSearchResult, SearchTrace } from "../src/index"
 import tuiPlugin, {
   copyToClipboard,
-  describeDecision,
+  stageRows,
+  renderPipeline,
+  dropsByReason,
+  shortChars,
+  shortMs,
+  hostOf,
+  shortTitle,
+  describeDropped,
+  describeScores,
   formatCount,
   formatReduction,
   explainEmpty,
@@ -65,8 +67,12 @@ import tuiPlugin, {
   traceView,
   wantsToast,
   formatAge,
+  describeScores,
 } from "../src/tui"
 import type { TuiContext, TuiToastOptions } from "../src/tui"
+import { DEFAULT_CHECKS, validateChecks, checksOf, findCheck, byPrecedence } from "../src/checks"
+import type { Check } from "../src/checks"
+import { formatChecks, formatCheck } from "../src/print-checks"
 
 const originalFetch = globalThis.fetch
 
@@ -303,7 +309,7 @@ function resultSet(): LangSearchResult[] {
 }
 
 describe("buildGateRequest", () => {
-  test("asks three typed questions per result and truncates content", () => {
+  test("asks one typed question per check per result and truncates content", () => {
     const results: LangSearchResult[] = [
       { url: "https://example.com/a", title: "A", content: "x".repeat(500), time: {} },
     ]
@@ -318,10 +324,8 @@ describe("buildGateRequest", () => {
       text: "x".repeat(200),
     })
     expect(Object.keys(request.questions).sort()).toEqual([
-      "evidence_0",
       "injection_0",
       "relevant_0",
-      "timely",
     ])
     expect(request.questions.relevant_0!.type).toBe("noul")
     expect(request.questions.relevant_0!.instructions).toContain("results.r0")
@@ -338,33 +342,34 @@ describe("buildGateRequest", () => {
 })
 
 describe("runGate", () => {
-  test("drops injections, off-topic and no-evidence results", async () => {
+  test("drops injections and off-topic results", async () => {
     routeFetch({
       [DEFAULT_GATE_ENDPOINT]: () =>
         systemOneResponse({
           relevant_0: 0.9,
-          evidence_0: 0.8,
           injection_0: 0.02,
           relevant_1: 0.05,
-          evidence_1: 0.05,
           injection_1: 0.02,
+          // On topic, but trying to steer the reader: injection wins over
+          // relevance whatever else it scores.
           relevant_2: 0.95,
-          evidence_2: 0.9,
           injection_2: 0.97,
           relevant_3: 0.85,
-          evidence_3: 0.1,
           injection_3: 0.02,
         }),
     })
 
     const outcome = await runGate("q", resultSet(), { maxResults: 4 })
 
-    expect(outcome.results.map((result) => result.url)).toEqual(["https://example.com/a"])
+    expect(outcome.results.map((result) => result.url)).toEqual([
+      "https://example.com/c".replace("/c", "/a"),
+      "https://example.com/d",
+    ])
     const reasons = Object.fromEntries(outcome.decisions.map((d) => [d.url, d.reason]))
     expect(reasons["https://example.com/a"]).toBe("kept")
     expect(reasons["https://example.com/b"]).toBe("irrelevant")
     expect(reasons["https://example.com/c"]).toBe("injection")
-    expect(reasons["https://example.com/d"]).toBe("no-evidence")
+    expect(reasons["https://example.com/d"]).toBe("kept")
     expect(outcome.usage).toEqual({ inputTokens: 10, outputTokens: 2 })
   })
 
@@ -826,120 +831,11 @@ describe("normalizeDedupeOption", () => {
 // Disagreement signal
 // ---------------------------------------------------------------------------
 
-describe("resolveDisagreementThreshold", () => {
-  test("defaults on, and a number overrides the threshold", () => {
-    expect(resolveDisagreementThreshold(undefined)).toBe(DEFAULT_DISAGREEMENT_THRESHOLD)
-    expect(resolveDisagreementThreshold(true)).toBe(DEFAULT_DISAGREEMENT_THRESHOLD)
-    expect(resolveDisagreementThreshold(0.8)).toBe(0.8)
-  })
-
-  test("false disables the question entirely", () => {
-    expect(resolveDisagreementThreshold(false)).toBeUndefined()
-  })
-
-  test("clamps nonsense into range", () => {
-    expect(resolveDisagreementThreshold(-1)).toBe(0)
-    expect(resolveDisagreementThreshold(9)).toBe(1)
-    expect(resolveDisagreementThreshold(Number.NaN)).toBe(DEFAULT_DISAGREEMENT_THRESHOLD)
-  })
-})
-
-describe("buildGateRequest agreement question", () => {
-  const two = [result("https://a.example/1", "one"), result("https://b.example/2", "two")]
-
-  test("asks about the set once, on top of the per-result questions", () => {
-    const request = buildGateRequest("q", two)
-    expect(Object.keys(request.questions)).toHaveLength(2 * 3 + 2)
-    expect(request.questions.agreement!.type).toBe("noul")
-    expect(request.questions.agreement!.instructions).toContain("materially different")
-  })
-
-  test("is skipped when there is nothing to compare", () => {
-    expect(buildGateRequest("q", [two[0]!]).questions.agreement).toBeUndefined()
-    expect(buildGateRequest("q", []).questions.agreement).toBeUndefined()
-  })
-
-  test("is skipped when disabled", () => {
-    expect(buildGateRequest("q", two, { flagDisagreement: false }).questions.agreement).toBeUndefined()
-  })
-})
-
-describe("runGate disagreement", () => {
-  const two = [result("https://a.example/1", "one"), result("https://b.example/2", "two")]
-  const passing = {
-    relevant_0: 0.9,
-    evidence_0: 0.9,
-    injection_0: 0.01,
-    relevant_1: 0.9,
-    evidence_1: 0.9,
-    injection_1: 0.01,
-  }
-
-  test("reports the score without dropping anything", async () => {
-    stubFetch(() => systemOneResponse({ ...passing, agreement: 0.93 }))
-    const outcome = await runGate("q", two, { apiKey: "k" })
-    expect(outcome.disagreement).toBe(0.93)
-    expect(outcome.results).toHaveLength(2)
-  })
-
-  test("is undefined when the question was not asked", async () => {
-    stubFetch(() => systemOneResponse(passing))
-    const outcome = await runGate("q", two, { apiKey: "k", flagDisagreement: false })
-    expect(outcome.disagreement).toBeUndefined()
-  })
-})
-
-describe("annotateToolContent", () => {
-  test("prepends a text block to the content array the model reads", () => {
-    // The shape opencode v2.0.10 actually passes to `tool.hook("execute.after")`.
-    const content = [{ type: "text", text: "## [A result](https://a.example/1)" }]
-    expect(annotateToolContent(content, "NOTE")).toEqual([
-      { type: "text", text: "NOTE" },
-      { type: "text", text: "## [A result](https://a.example/1)" },
-    ])
-  })
-
-  test("does not mutate the content it was given", () => {
-    const content = [{ type: "text", text: "body" }]
-    annotateToolContent(content, "NOTE")
-    expect(content).toHaveLength(1)
-  })
-
-  test("handles plain-string content", () => {
-    expect(annotateToolContent("body", "NOTE")).toBe("NOTE\n\nbody")
-    expect(annotateToolContent("", "NOTE")).toBe("NOTE")
-  })
-
-  test("leaves shapes it does not recognise untouched", () => {
-    expect(annotateToolContent(undefined, "NOTE")).toBeUndefined()
-    expect(annotateToolContent({ odd: true }, "NOTE")).toEqual({ odd: true })
-  })
-})
-
-describe("createNoteStore", () => {
-  test("delivers a note once", () => {
-    const notes = createNoteStore()
-    notes.set("q", "NOTE")
-    expect(notes.take("q")).toBe("NOTE")
-    expect(notes.take("q")).toBeUndefined()
-  })
-
-  test("is bounded, so a hook that never fires cannot grow it", () => {
-    const notes = createNoteStore(2)
-    notes.set("a", "1")
-    notes.set("b", "2")
-    notes.set("c", "3")
-    expect(notes.size).toBe(2)
-    expect(notes.take("a")).toBeUndefined()
-    expect(notes.take("c")).toBe("3")
-  })
-})
-
 // ---------------------------------------------------------------------------
 // Wiring: deduplicate before the gate, annotate after the tool
 // ---------------------------------------------------------------------------
 
-describe("plugin integration: duplicates and disagreement", () => {
+describe("plugin integration: duplicate collapsing", () => {
   const duplicatePayload = {
     code: 200,
     data: {
@@ -1023,38 +919,6 @@ describe("plugin integration: duplicates and disagreement", () => {
     expect(results.map((r) => r.url)).toEqual(["https://a.example/story", "https://c.example/independent"])
   })
 
-  test("disagreement above the threshold annotates the websearch tool output", async () => {
-    const { ctx, editor, fireToolHook } = makeContext({ apiKey: "k", gate: {} })
-    await plugin.setup(ctx as never)
-
-    routeFetch({
-      [ENDPOINT]: () => jsonResponse(samplePayload),
-      [DEFAULT_GATE_ENDPOINT]: () =>
-        systemOneResponse({
-          relevant_0: 0.9,
-          evidence_0: 0.9,
-          injection_0: 0.01,
-          relevant_1: 0.9,
-          evidence_1: 0.9,
-          injection_1: 0.01,
-          agreement: 0.93,
-        }),
-    })
-
-    await editor.added[0]!.execute({ query: "mount fuji" }, { signal: new AbortController().signal })
-
-    const event = await fireToolHook({
-      tool: "websearch",
-      status: "completed",
-      input: { query: "mount fuji" },
-      result: { output: { provider: "langsearch" }, content: [{ type: "text", text: "## results" }] },
-    })
-
-    const content = (event.result as { content: Array<{ type: string; text: string }> }).content
-    expect(content[0]).toEqual({ type: "text", text: DISAGREEMENT_NOTE })
-    expect(content[1]).toEqual({ type: "text", text: "## results" })
-  })
-
   test("nothing is annotated when the sources agree", async () => {
     const { ctx, editor, fireToolHook } = makeContext({ apiKey: "k", gate: {} })
     await plugin.setup(ctx as never)
@@ -1084,60 +948,11 @@ describe("plugin integration: duplicates and disagreement", () => {
     expect((event.result as { content: unknown[] }).content).toHaveLength(1)
   })
 
-  test("a note is never delivered to a different search, tool, or failed call", async () => {
-    const { ctx, editor, fireToolHook } = makeContext({ apiKey: "k", gate: {} })
-    await plugin.setup(ctx as never)
-
-    routeFetch({
-      [ENDPOINT]: () => jsonResponse(samplePayload),
-      [DEFAULT_GATE_ENDPOINT]: () =>
-        systemOneResponse({
-          relevant_0: 0.9,
-          evidence_0: 0.9,
-          injection_0: 0.01,
-          relevant_1: 0.9,
-          evidence_1: 0.9,
-          injection_1: 0.01,
-          agreement: 0.93,
-        }),
-    })
-    await editor.added[0]!.execute({ query: "mount fuji" }, { signal: new AbortController().signal })
-
-    const base = { result: { content: [{ type: "text", text: "body" }] } }
-    const other = await fireToolHook({ ...base, tool: "read", status: "completed", input: { query: "mount fuji" } })
-    const failed = await fireToolHook({ ...base, tool: "websearch", status: "error", input: { query: "mount fuji" } })
-    const different = await fireToolHook({
-      result: { content: [{ type: "text", text: "body" }] },
-      tool: "websearch",
-      status: "completed",
-      input: { query: "a different question" },
-    })
-
-    for (const event of [other, failed, different]) {
-      expect((event.result as { content: unknown[] }).content).toHaveLength(1)
-    }
-
-    // The note is still waiting for its own search, and is delivered once.
-    const mine = await fireToolHook({
-      result: { content: [{ type: "text", text: "body" }] },
-      tool: "websearch",
-      status: "completed",
-      input: { query: "mount fuji" },
-    })
-    expect((mine.result as { content: unknown[] }).content).toHaveLength(2)
-    const again = await fireToolHook({
-      result: { content: [{ type: "text", text: "body" }] },
-      tool: "websearch",
-      status: "completed",
-      input: { query: "mount fuji" },
-    })
-    expect((again.result as { content: unknown[] }).content).toHaveLength(1)
-  })
-
   test("a host without `tool.hook` still registers the provider and searches", async () => {
     const warn = spyOn(console, "warn").mockImplementation(() => {})
     try {
-      const { ctx, editor } = makeContext({ apiKey: "k", gate: {} }, { withToolHook: false })
+      // Only the debug trace needs the hook now, so the warning is tied to it.
+      const { ctx, editor } = makeContext({ apiKey: "k", gate: {}, debug: true }, { withToolHook: false })
       await plugin.setup(ctx as never)
 
       expect(editor.added).toHaveLength(1)
@@ -1515,19 +1330,14 @@ describe("describeQuestions", () => {
     ])
     const described = describeQuestions(request.questions)
 
-    expect(Object.keys(described).sort()).toEqual([
-      "agreement",
-      "evidence",
-      "injection",
-      "relevant",
-      "timely",
-    ])
+    expect(Object.keys(described).sort()).toEqual(["injection", "relevant"])
     expect(described.relevant!.asked).toBe(2)
-    expect(described.agreement!.asked).toBe(1)
     // The key a question pointed at is noise; the question itself is not.
     expect(described.relevant!.instructions).toContain("`results.<key>`")
     expect(described.relevant!.instructions).not.toContain("results.r0")
-    expect(described.relevant!.criteria.true).toBe("It addresses the subject of the query")
+    // Criteria are optional and the shipped checks omit them: the question is
+    // unambiguous on its own, which is what TypeSafe's own guidance asks for.
+    expect(described.relevant!.criteria).toBeUndefined()
   })
 
   test("passage questions collapse too", () => {
@@ -1546,10 +1356,7 @@ describe("resolveGateThresholds", () => {
     expect(resolveGateThresholds()).toEqual({
       maxResults: 4,
       minRelevance: 0.45,
-      minEvidence: 0.5,
       maxInjection: 0.5,
-      minTimely: 0.5,
-      maxAgeDays: 180,
     })
   })
 
@@ -1557,12 +1364,8 @@ describe("resolveGateThresholds", () => {
     expect(resolveGateThresholds({ maxResults: 999, minRelevance: 5, maxInjection: -2 })).toEqual({
       maxResults: 50,
       minRelevance: 1,
-      minEvidence: 0.5,
       maxInjection: 0,
-      minTimely: 0.5,
-      maxAgeDays: 180,
     })
-    expect(resolveGateThresholds({ recency: false }).maxAgeDays).toBeUndefined()
   })
 })
 
@@ -1607,19 +1410,16 @@ describe("buildTrace", () => {
         ],
         usage: { inputTokens: 1200 },
         durationMs: 150,
-        disagreement: 0.82,
         request: buildGateRequest("q", results),
       },
     }
 
-    const trace = buildTrace({ ...base, gate: {}, collector, flagged: true })
+    const trace = buildTrace({ ...base, gate: {}, collector })
 
     expect(trace.gate!.model).toBe(DEFAULT_GATE_MODEL)
     expect(trace.gate!.endpoint).toBe(DEFAULT_GATE_ENDPOINT)
     expect(trace.gate!.thresholds).toEqual(resolveGateThresholds())
     expect(trace.gate!.decisions).toHaveLength(2)
-    expect(trace.gate!.disagreement).toBe(0.82)
-    expect(trace.gate!.flagged).toBe(true)
     expect(trace.gate!.usage.inputTokens).toBe(1200)
     expect(Object.keys(trace.gate!.questions)).toContain("relevant")
     // Nothing that was sent to jev is carried into the trace.
@@ -1753,20 +1553,13 @@ describe("createPendingStore", () => {
     expect(store.take("c")).toBe(3)
   })
 
-  test("createNoteStore is the same mechanism", () => {
-    const notes = createNoteStore()
-    notes.set("q", "note")
-    expect(notes.take("q")).toBe("note")
-  })
 })
 
 describe("plugin debug trace", () => {
   const gateAnswers = {
     relevant_0: 0.99,
-    evidence_0: 0.98,
     injection_0: 0.01,
-    relevant_1: 0.1,
-    evidence_1: 0.1,
+    relevant_1: 0.9,
     injection_1: 0.02,
     agreement: 0.2,
   }
@@ -1800,40 +1593,12 @@ describe("plugin debug trace", () => {
     const trace = result.metadata[TRACE_METADATA_KEY] as SearchTrace
     expect(trace.query).toBe("mount fuji")
     expect(trace.found).toBe(2)
-    expect(trace.returned).toBe(1)
+    expect(trace.returned).toBe(2)
     expect(trace.gate!.decisions).toHaveLength(2)
     expect(trace.gate!.decisions[0]!.kept).toBe(true)
-    expect(trace.gate!.decisions[1]!.reason).toBe("irrelevant")
-    expect(trace.gate!.disagreement).toBe(0.2)
+    expect(trace.gate!.decisions[1]!.reason).toBe("kept")
     expect(trace.gate!.flagged).toBeUndefined()
     expect(Object.keys(trace.gate!.questions)).toContain("injection")
-  })
-
-  test("the note and the trace ride on the same result", async () => {
-    const { ctx, editor, fireToolHook } = makeContext({
-      apiKey: "k",
-      debug: true,
-      gate: { apiKey: "typesafe", trimPassages: false },
-    })
-    await plugin.setup(ctx as never)
-
-    routeFetch({
-      [ENDPOINT]: () => jsonResponse(samplePayload),
-      [DEFAULT_GATE_ENDPOINT]: () => systemOneResponse({ ...gateAnswers, agreement: 0.93 }),
-    })
-
-    await editor.added[0]!.execute({ query: "mount fuji" }, { signal: new AbortController().signal })
-
-    const event = await fireToolHook({
-      tool: "websearch",
-      status: "completed",
-      input: { query: "mount fuji" },
-      result: { content: [{ type: "text", text: "## results" }] },
-    })
-
-    const result = event.result as { content: Array<{ text: string }>; metadata: Record<string, unknown> }
-    expect(result.content[0]!.text).toBe(DISAGREEMENT_NOTE)
-    expect((result.metadata[TRACE_METADATA_KEY] as SearchTrace).gate!.flagged).toBe(true)
   })
 
   test("records a search the gate never saw", async () => {
@@ -2143,7 +1908,6 @@ describe("tui formatting", () => {
     expect(summary).toContain("1 gated out")
     expect(summary).toContain("2 returned")
     expect(summary).toContain("77.5k→15.9k chars (79% cut)")
-    expect(summary).toContain("sources disagree")
   })
 
   test("a failure is named in the summary and raises the variant", () => {
@@ -2164,14 +1928,6 @@ describe("tui formatting", () => {
     expect(toastVariant(sampleTrace())).toBe("info")
   })
 
-  test("describeDecision says what happened and why", () => {
-    expect(
-      describeDecision({ index: 0, url: "u", relevant: 0.99, evidence: 0.98, injection: 0.01, kept: true, reason: "kept" }),
-    ).toBe("kept · relevance 0.99 · evidence 0.98 · injection 0.01")
-    expect(
-      describeDecision({ index: 1, url: "u", relevant: 0.2, evidence: 0.1, injection: 0.9, kept: false, reason: "injection" }),
-    ).toContain("dropped (injection)")
-  })
 
   test("renderTrace shows the questions jev was asked", () => {
     const request = buildGateRequest("q", [{ url: "https://a.example", title: "A", content: "a", time: {} }])
@@ -2191,11 +1947,10 @@ describe("tui formatting", () => {
     })
 
     const rendered = renderTrace(trace)
-    expect(rendered).toContain("What jev was asked")
+    expect(rendered).toContain("WHAT JEV WAS ASKED")
     expect(rendered).toContain("`results.<key>`")
     expect(rendered).toContain("relevance 0.99")
-    expect(rendered).toContain("disagreement: 0.20 (below the threshold)")
-    expect(rendered).toContain("1200 input tokens")
+    expect(rendered).toContain("1,200 jev tokens")
   })
 
   test("traceView pairs the query with the rendered trace", () => {
@@ -2409,14 +2164,13 @@ describe("a malformed trace degrades instead of breaking", () => {
 
     expect(() => summarizeTrace(broken)).not.toThrow()
     expect(() => renderTrace(broken)).not.toThrow()
-    expect(renderTrace(broken)).toContain("nothing dropped")
+    expect(renderTrace(broken)).toContain("no duplicates found")
   })
 
   test("a missing score reads as unknown rather than throwing", () => {
-    const decision = { index: 0, url: "u", kept: false, reason: "irrelevant" } as unknown as Parameters<
-      typeof describeDecision
-    >[0]
-    expect(describeDecision(decision)).toContain("relevance ?")
+    const decision = { index: 0, url: "u", kept: false, reason: "irrelevant" } as unknown as GateDecision
+    expect(describeScores(decision)).toContain("?")
+    expect(() => describeDropped(decision)).not.toThrow()
   })
 })
 
@@ -2449,138 +2203,6 @@ describe("ageInDays", () => {
   })
 })
 
-describe("resolveRecency", () => {
-  test("is on by default", () => {
-    expect(resolveRecency(undefined)).toEqual({ minTimely: 0.5, maxAgeDays: 180 })
-    expect(resolveRecency(true)).toEqual({ minTimely: 0.5, maxAgeDays: 180 })
-  })
-
-  test("false turns the question off entirely", () => {
-    expect(resolveRecency(false)).toBeUndefined()
-  })
-
-  test("takes overrides and clamps them", () => {
-    expect(resolveRecency({ minTimely: 0.8, maxAgeDays: 30 })).toEqual({ minTimely: 0.8, maxAgeDays: 30 })
-    // Clamped to the range, the same way minRelevance is - not reset to the default.
-    expect(resolveRecency({ minTimely: 5 })).toEqual({ minTimely: 1, maxAgeDays: 180 })
-    expect(resolveRecency({ minTimely: Number.NaN })).toEqual({ minTimely: 0.5, maxAgeDays: 180 })
-    expect(resolveRecency({ maxAgeDays: -10 })).toEqual({ minTimely: 0.5, maxAgeDays: 0 })
-  })
-})
-
-describe("the recency question", () => {
-  test("asks about the query, not about any result", () => {
-    const request = buildGateRequest("price of bitcoin", [result("https://a.example", "a")])
-    const timely = request.questions.timely!
-    expect(timely.type).toBe("noul")
-    // The distinction that makes this worth a question: `evidence` asks whether
-    // a result states a fact, this asks whether a past fact still answers the
-    // question. It must not name a result.
-    expect(timely.instructions).toContain("`query`")
-    expect(timely.instructions).not.toContain("results.")
-    expect(timely.instructions).toContain("current as of today")
-  })
-
-  test("is asked once however many results there are", () => {
-    const many = [result("https://a.example", "a"), result("https://b.example", "b"), result("https://c.example", "c")]
-    expect(buildGateRequest("q", many).questions.timely).toBeDefined()
-    expect(Object.keys(buildGateRequest("q", many).questions).filter((k) => k.startsWith("timely"))).toHaveLength(1)
-  })
-
-  test("jev is never asked how old anything is - it has no clock", () => {
-    const request = buildGateRequest("q", [result("https://a.example", "a")])
-    for (const question of Object.values(request.questions)) {
-      expect(question.instructions).not.toMatch(/how old|published|age of|date/i)
-    }
-  })
-
-  test("is skipped when disabled", () => {
-    expect(buildGateRequest("q", [result("https://a.example", "a")], { recency: false }).questions.timely).toBeUndefined()
-  })
-})
-
-describe("runGate recency", () => {
-  const dated = (url: string, published: number): LangSearchResult => ({
-    url,
-    title: url,
-    content: "bitcoin is worth something",
-    time: { published },
-  })
-  const now = Date.now()
-  const day = 86_400_000
-  const fresh = dated("https://fresh.example", now - 10 * day)
-  const stale = dated("https://stale.example", now - 2900 * day)
-  const scores = {
-    relevant_0: 0.9,
-    evidence_0: 0.9,
-    injection_0: 0.01,
-    relevant_1: 0.84,
-    evidence_1: 0.84,
-    injection_1: 0.04,
-  }
-
-  test("drops a stale result the evidence score would have kept", async () => {
-    // The bitcoin case: the 2018 page scores 0.84/0.84 because "currently worth
-    // $6,293" is a maximally specific fact. Only its age disqualifies it.
-    stubFetch(() => systemOneResponse({ ...scores, timely: 0.95 }))
-    const outcome = await runGate("price of bitcoin", [fresh, stale], { apiKey: "k" })
-    expect(outcome.timely).toBe(0.95)
-    expect(outcome.results.map((r) => r.url)).toEqual(["https://fresh.example"])
-    const dropped = outcome.decisions.find((d) => d.url === "https://stale.example")!
-    expect(dropped.reason).toBe("stale")
-    expect(dropped.evidence).toBe(0.84)
-  })
-
-  test("keeps the same stale result when the answer does not go stale", async () => {
-    stubFetch(() => systemOneResponse({ ...scores, timely: 0.02 }))
-    const outcome = await runGate("who wrote Hamlet", [fresh, stale], { apiKey: "k" })
-    expect(outcome.results).toHaveLength(2)
-    expect(outcome.decisions.every((d) => d.reason !== "stale")).toBe(true)
-  })
-
-  test("records each result's age whether or not it was dropped", async () => {
-    stubFetch(() => systemOneResponse({ ...scores, timely: 0.95 }))
-    const outcome = await runGate("q", [fresh, stale], { apiKey: "k" })
-    expect(outcome.decisions[0]!.ageDays).toBe(10)
-    expect(outcome.decisions[1]!.ageDays).toBe(2900)
-  })
-
-  test("never drops an undated result as stale", async () => {
-    const undated = result("https://undated.example", "no date here")
-    stubFetch(() => systemOneResponse({ ...scores, timely: 0.99 }))
-    const outcome = await runGate("q", [fresh, undated], { apiKey: "k" })
-    expect(outcome.results).toHaveLength(2)
-    expect(outcome.decisions[1]!.ageDays).toBeUndefined()
-  })
-
-  test("falls back to the newest result, not the highest scoring one", async () => {
-    // Everything is stale, so the fallback fires. Relevance and evidence are
-    // exactly what put the oldest page on top, so they must not choose here.
-    const older = dated("https://older.example", now - 3000 * day)
-    stubFetch(() =>
-      systemOneResponse({
-        relevant_0: 0.99,
-        evidence_0: 0.99,
-        injection_0: 0.01,
-        relevant_1: 0.5,
-        evidence_1: 0.5,
-        injection_1: 0.01,
-        timely: 0.95,
-      }),
-    )
-    const outcome = await runGate("q", [older, stale], { apiKey: "k" })
-    expect(outcome.results.map((r) => r.url)).toEqual(["https://stale.example"])
-    expect(outcome.decisions.find((d) => d.url === "https://stale.example")!.reason).toBe("fallback")
-  })
-
-  test("is not asked, and nothing is aged, when disabled", async () => {
-    stubFetch(() => systemOneResponse(scores))
-    const outcome = await runGate("q", [fresh, stale], { apiKey: "k", recency: false })
-    expect(outcome.timely).toBeUndefined()
-    expect(outcome.results).toHaveLength(2)
-  })
-})
-
 describe("withDateline", () => {
   test("puts the date where the model is certain to read it", () => {
     const published = Date.UTC(2018, 8, 16, 7, 8, 14)
@@ -2607,5 +2229,324 @@ describe("formatAge", () => {
     expect(formatAge(45)).toBe("45 days old")
     expect(formatAge(180)).toBe("6 months old")
     expect(formatAge(2926)).toBe("8.0 years old")
+  })
+})
+
+describe("checks.ts as the source of truth", () => {
+  test("every default check is valid", () => {
+    expect(() => validateChecks()).not.toThrow()
+  })
+
+  test("an id with an underscore is rejected, because it would break the trace", () => {
+    // `describeQuestions` splits on the first underscore, so `ai_slop_0` would
+    // be grouped under the kind `ai`.
+    const bad: Check[] = [{ ...DEFAULT_CHECKS[0]!, id: "ai_slop" }]
+    expect(() => validateChecks(bad)).toThrow(/invalid check id/)
+  })
+
+  test("a duplicate or reserved id is rejected", () => {
+    expect(() => validateChecks([DEFAULT_CHECKS[0]!, DEFAULT_CHECKS[0]!])).toThrow(/duplicate/)
+    expect(() => validateChecks([{ ...DEFAULT_CHECKS[0]!, id: "passage" }])).toThrow(/reserved/)
+  })
+
+  test("bounds that nothing can satisfy are rejected", () => {
+    const impossible: Check[] = [{ ...DEFAULT_CHECKS[0]!, keep: { min: 0.8, max: 0.2 } }]
+    expect(() => validateChecks(impossible)).toThrow(/nothing can pass/)
+    expect(() => validateChecks([{ ...DEFAULT_CHECKS[0]!, keep: { min: 4 } }])).toThrow(/between 0 and 1/)
+  })
+
+  test("only enabled checks are asked", () => {
+    expect(checksOf("result").map((c) => c.id)).toEqual(["injection", "relevant"])
+    const off: Check[] = [{ ...DEFAULT_CHECKS[0]!, enabled: false }]
+    expect(checksOf("result", off)).toEqual([])
+  })
+
+  test("the thresholds the trace reports come from the file", () => {
+    const checks = DEFAULT_CHECKS.map((c) => (c.id === "relevant" ? { ...c, keep: { min: 0.9 } } : c))
+    expect(resolveGateThresholds({ checks }).minRelevance).toBe(0.9)
+    // A plugin option still wins, so existing configs are unaffected.
+    expect(resolveGateThresholds({ checks, minRelevance: 0.2 }).minRelevance).toBe(0.2)
+  })
+})
+
+// Defined here, not shipped: the mechanism is tested without the package
+// carrying a check whose thresholds nobody has calibrated.
+const PAYWALL: Check = {
+  id: "paywall",
+  scope: "result",
+  why: "Is the body a subscribe prompt rather than the article?",
+  instructions: "Is `results.<key>` mostly a prompt to subscribe or log in, rather than the article itself?",
+  criteria: {
+    true: "It is mostly a subscription or login prompt",
+    false: "It is the article text",
+  },
+  keep: { max: 0.5 },
+}
+
+describe("adding a check", () => {
+  const withPaywall = [...DEFAULT_CHECKS, PAYWALL]
+  const two = [result("https://a.example/1", "one"), result("https://b.example/2", "two")]
+
+  test("is asked once per result, with no other change", () => {
+    const request = buildGateRequest("q", two, { checks: withPaywall })
+    expect(request.questions.paywall_0!.instructions).toContain("results.r0")
+    expect(request.questions.paywall_1!.instructions).toContain("results.r1")
+    expect(describeQuestions(request.questions).paywall!.asked).toBe(2)
+  })
+
+  test("drops a result under its own reason, and records its score", async () => {
+    stubFetch(() =>
+      systemOneResponse({
+        relevant_0: 0.9, evidence_0: 0.9, injection_0: 0.01, paywall_0: 0.05,
+        relevant_1: 0.9, evidence_1: 0.9, injection_1: 0.01, paywall_1: 0.95,
+      }),
+    )
+    const outcome = await runGate("q", two, { apiKey: "k", checks: withPaywall })
+    expect(outcome.results.map((r) => r.url)).toEqual(["https://a.example/1"])
+    const dropped = outcome.decisions[1]!
+    expect(dropped.reason).toBe("paywall")
+    expect(dropped.scores!.paywall).toBe(0.95)
+    // The result was otherwise perfect: only the new check removed it.
+    expect(dropped.relevant).toBe(0.9)
+  })
+
+  test("the shipped list asks nothing extra", () => {
+    const off = buildGateRequest("q", two)
+    expect(Object.keys(off.questions).some((k) => k.startsWith("paywall"))).toBe(false)
+  })
+})
+
+describe("bun run checks", () => {
+  test("prints each question, what it costs and what it does", () => {
+    const text = formatChecks()
+    expect(text).toContain("2 per result, 0 per search")
+    expect(text).toContain("A search over 5 results therefore asks 10 questions")
+    expect(text).toContain("keep the result when score >= 0.45")
+    expect(text).toContain("keep the result when score <= 0.5")
+    for (const check of DEFAULT_CHECKS) expect(text).toContain(check.instructions)
+  })
+
+  test("marks a disabled check as disabled", () => {
+    expect(formatCheck({ ...DEFAULT_CHECKS[0]!, enabled: false })).toContain("(disabled)")
+  })
+
+  test("a check with no bounds says it only records", () => {
+    expect(formatCheck({ ...DEFAULT_CHECKS[0]!, keep: undefined })).toContain("never used to drop anything")
+  })
+})
+
+describe("describeScores", () => {
+  test("reports exactly the checks that were asked, in the order asked", () => {
+    const decision = {
+      index: 0, url: "https://a.example", relevant: 0.9, evidence: 0.9, injection: 0.1,
+      scores: { relevant: 0.9, evidence: 0.9, injection: 0.1, slop: 0.87 },
+      kept: false, reason: "slop",
+    }
+    expect(describeScores(decision)).toBe("relevance 0.90 · evidence 0.90 · injection 0.10 · slop 0.87")
+  })
+
+  test("a disabled check is absent rather than reported as zero", () => {
+    const decision = {
+      index: 0, url: "https://a.example", relevant: 0.9, evidence: 0, injection: 0.1,
+      scores: { relevant: 0.9, injection: 0.1 },
+      kept: true, reason: "kept",
+    }
+    expect(describeScores(decision)).toBe("relevance 0.90 · injection 0.10")
+    expect(describeScores(decision)).not.toContain("evidence")
+  })
+
+  test("falls back to the three fields for a decision recorded before scores existed", () => {
+    expect(
+      describeScores({ index: 0, url: "u", relevant: 0.5, evidence: 0.4, injection: 0.3, kept: true, reason: "kept" }),
+    ).toBe("relevance 0.50 · evidence 0.40 · injection 0.30")
+  })
+})
+
+describe("which failure is reported", () => {
+  const two = [result("https://a.example/1", "one"), result("https://b.example/2", "two")]
+
+  test("an injection attempt is reported as one even when it is also off topic", async () => {
+    // The checks are asked in file order, which puts `relevant` first. A page
+    // that fails both must still be reported as an injection attempt: that is
+    // the security-relevant fact, and it must not depend on list order.
+    stubFetch(() =>
+      systemOneResponse({
+        relevant_0: 0.01, evidence_0: 0.01, injection_0: 0.99,
+        relevant_1: 0.9, evidence_1: 0.9, injection_1: 0.01,
+      }),
+    )
+    const outcome = await runGate("q", two, { apiKey: "k" })
+    expect(outcome.decisions[0]!.reason).toBe("injection")
+  })
+
+  test("precedence, not file order, decides", () => {
+    const reordered = byPrecedence(checksOf("result"))
+    expect(reordered[0]!.id).toBe("injection")
+    // Precedence holds even if the file is reordered.
+    const shuffled = [...DEFAULT_CHECKS].reverse()
+    expect(byPrecedence(checksOf("result", shuffled))[0]!.id).toBe("injection")
+  })
+})
+
+describe("a broken checks file", () => {
+  test("fails the plugin load rather than silently disabling the gate", async () => {
+    // Thrown from `setup`, not from the search path: the gate's fail-open
+    // handler would have swallowed it and returned ungated results.
+    const { ctx } = makeContext({
+      apiKey: "k",
+      gate: { apiKey: "typesafe", checks: [{ ...DEFAULT_CHECKS[0]!, id: "ai_slop" }] },
+    })
+    await expect(plugin.setup(ctx as never)).rejects.toThrow(/invalid check id/)
+  })
+
+  test("a valid file loads and registers the provider", async () => {
+    const { ctx, editor } = makeContext({ apiKey: "k", gate: { apiKey: "typesafe" } })
+    await plugin.setup(ctx as never)
+    expect(editor.added).toHaveLength(1)
+  })
+
+  test("nothing is validated when the gate is off, because nothing is asked", async () => {
+    // `checksOf` is only reachable through the gate, so a broken file cannot
+    // break a plain search.
+    const { ctx, editor } = makeContext({ apiKey: "k" })
+    await plugin.setup(ctx as never)
+    expect(editor.added).toHaveLength(1)
+  })
+})
+
+describe("disabling a default check", () => {
+  const without = DEFAULT_CHECKS.filter((c) => c.id !== "relevant")
+  const two = [result("https://a.example/1", "one"), result("https://b.example/2", "two")]
+
+  test("stops it being asked", () => {
+    const request = buildGateRequest("q", two, { checks: without })
+    expect(Object.keys(request.questions).some((k) => k.startsWith("relevant"))).toBe(false)
+  })
+
+  test("stops the trace claiming a threshold that was never applied", () => {
+    expect(resolveGateThresholds({ checks: without }).minRelevance).toBeUndefined()
+    expect(resolveGateThresholds().minRelevance).toBe(0.45)
+  })
+
+  test("stops it being recorded as a flat zero", async () => {
+    stubFetch(() =>
+      systemOneResponse({ injection_0: 0.01, injection_1: 0.01 }),
+    )
+    const outcome = await runGate("q", two, { apiKey: "k", checks: without })
+    expect(outcome.decisions[0]!.scores).toEqual({ injection: 0.01 })
+    expect(outcome.results).toHaveLength(2)
+  })
+})
+
+describe("the pipeline reflects what actually ran", () => {
+  const base = {
+    query: "q",
+    startedAt: "2026-09-20T00:00:00.000Z",
+    found: 8,
+    returned: 4,
+    searchMs: 2000,
+    totalMs: 2500,
+    stages: {
+      found: { items: 8, chars: 12000 },
+      returned: { items: 4, chars: 3000 },
+    },
+  } as SearchTrace
+
+  test("a search on its own is one stage", () => {
+    const rows = stageRows(base)
+    expect(rows.map((r) => r.name)).toEqual(["search"])
+  })
+
+  test("no duplicate-filter row when the filter did not run", () => {
+    expect(stageRows(base).some((r) => r.name === "duplicate filter")).toBe(false)
+    const withDedupe = { ...base, dedupe: { minContainment: 0.8, dropped: [] } }
+    expect(stageRows(withDedupe).map((r) => r.name)).toEqual(["search", "duplicate filter"])
+  })
+
+  test("stages are numbered by what ran, not by a fixed list", () => {
+    const withGate = {
+      ...base,
+      gate: {
+        model: "jev-latest",
+        endpoint: DEFAULT_GATE_ENDPOINT,
+        thresholds: resolveGateThresholds(),
+        questions: {},
+        decisions: [
+          { index: 0, url: "https://a.example", relevant: 0.9, evidence: 0, injection: 0.01, kept: true, reason: "kept" },
+          { index: 1, url: "https://b.example", relevant: 0.1, evidence: 0, injection: 0.01, kept: false, reason: "irrelevant" },
+        ],
+        durationMs: 200,
+        usage: { inputTokens: 3000 },
+      },
+    } as SearchTrace
+    // The gate is stage 2 without dedupe and stage 3 with it.
+    expect(stageRows(withGate).find((r) => r.name === "jev gate")!.n).toBe(2)
+    const both = { ...withGate, dedupe: { minContainment: 0.8, dropped: [] } }
+    expect(stageRows(both).find((r) => r.name === "jev gate")!.n).toBe(3)
+  })
+
+  test("a failed stage says so instead of showing a clean transition", () => {
+    const failed = {
+      ...base,
+      gate: {
+        model: "jev-latest",
+        endpoint: DEFAULT_GATE_ENDPOINT,
+        thresholds: resolveGateThresholds(),
+        questions: {},
+        decisions: [],
+        durationMs: 30,
+        usage: {},
+        failed: "HTTP 500",
+      },
+    } as SearchTrace
+    const text = renderPipeline(failed).join("\n")
+    expect(text).toContain("FAILED: HTTP 500")
+    expect(text).toContain("passed through unchanged")
+  })
+
+  test("a check added to checks.ts appears as its own drop reason, with no change here", () => {
+    // `dropsByReason` reads the reason recorded on each decision, and that
+    // reason is the check's id. Nothing in the renderer knows the check names.
+    const decisions = [
+      { index: 0, url: "u", relevant: 0.9, evidence: 0, injection: 0.01, kept: true, reason: "kept" },
+      { index: 1, url: "u", relevant: 0.1, evidence: 0, injection: 0.01, kept: false, reason: "irrelevant" },
+      { index: 2, url: "u", relevant: 0.9, evidence: 0, injection: 0.99, kept: false, reason: "injection" },
+      { index: 3, url: "u", relevant: 0.9, evidence: 0, injection: 0.01, kept: false, reason: "paywall" },
+      { index: 4, url: "u", relevant: 0.9, evidence: 0, injection: 0.01, kept: false, reason: "paywall" },
+    ]
+    expect(dropsByReason(decisions)).toEqual([
+      ["paywall", 2],
+      ["irrelevant", 1],
+      ["injection", 1],
+    ])
+  })
+
+  test("the end-to-end reduction is search output versus what the model read", () => {
+    const text = renderPipeline(base).join("\n")
+    expect(text).toContain("8 results / 12.0k chars")
+    expect(text).toContain("4 results / 3.0k chars")
+    expect(text).toContain("75% less text reaches the model")
+  })
+})
+
+describe("pipeline formatting helpers", () => {
+  test("shortChars and shortMs stay readable", () => {
+    expect(shortChars(940)).toBe("940")
+    expect(shortChars(12318)).toBe("12.3k")
+    expect(shortChars(undefined)).toBe("?")
+    expect(shortMs(221)).toBe("221ms")
+    expect(shortMs(2438)).toBe("2.4s")
+  })
+
+  test("hostOf strips the scheme and www", () => {
+    expect(hostOf("https://www.unilad.com/news/politics/x")).toBe("unilad.com")
+    expect(hostOf("https://en.wikipedia.org/wiki/Mars")).toBe("en.wikipedia.org")
+    expect(hostOf(42)).toBe("?")
+  })
+
+  test("shortTitle keeps one terminal line", () => {
+    expect(shortTitle("short", "u")).toBe("short")
+    expect(shortTitle("x".repeat(100), "u")).toHaveLength(72)
+    expect(shortTitle(undefined, "https://a.example")).toBe("https://a.example")
   })
 })

@@ -51,7 +51,8 @@
     "build:types": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "bun test",
-    "prepack": "bun run build && bun run build:types"
+    "prepack": "bun run build && bun run build:types",
+    "checks": "bun run src/print-checks.ts"
   },
   "dependencies": {
     "@opencode/plugin": "^2.0.0"
@@ -62,9 +63,15 @@
     "solid-js": ">=1.9.0"
   },
   "peerDependenciesMeta": {
-    "@opentui/core": { "optional": true },
-    "@opentui/solid": { "optional": true },
-    "solid-js": { "optional": true }
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@opentui/core": "^0.5.11",

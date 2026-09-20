@@ -256,17 +256,18 @@ export function summarizeTrace(trace: SearchTrace): string {
 
   parts.push(`${trace.returned} returned`)
 
-  if (trace.trim && !trace.trim.failed && trace.trim.charsBefore > 0) {
-    const reduction = formatReduction(trace.trim.charsBefore, trace.trim.charsAfter)
-    parts.push(
-      `${formatCount(trace.trim.charsBefore)}→${formatCount(trace.trim.charsAfter)} chars` +
-        (reduction ? ` (${reduction} cut)` : ""),
-    )
+  // End to end when the stage sizes are there, because that is the number the
+  // user cares about: what the search returned versus what the model read.
+  // Falls back to the trim stage alone for traces recorded before that.
+  const from = trace.stages?.found?.chars ?? trace.trim?.charsBefore
+  const to = trace.stages?.returned?.chars ?? trace.trim?.charsAfter
+  if (typeof from === "number" && typeof to === "number" && from > 0) {
+    const reduction = formatReduction(from, to)
+    parts.push(`${formatCount(from)}→${formatCount(to)} chars` + (reduction ? ` (${reduction} cut)` : ""))
   }
 
   parts.push(`${trace.totalMs}ms`)
 
-  if (trace.gate?.flagged) parts.push("sources disagree")
   if (trace.gate?.failed) parts.push("gate failed")
   if (trace.trim?.failed) parts.push("trim failed")
 
@@ -294,17 +295,6 @@ function list<T>(value: unknown): T[] {
   return Array.isArray(value) ? (value as T[]) : []
 }
 
-/** One line per result: whether jev kept it, why, and the three scores behind that. */
-export function describeDecision(decision: GateDecision): string {
-  const scores =
-    `relevance ${score(decision.relevant)} · ` +
-    `evidence ${score(decision.evidence)} · ` +
-    `injection ${score(decision.injection)}`
-  const age = typeof decision.ageDays === "number" && Number.isFinite(decision.ageDays)
-    ? ` · ${formatAge(decision.ageDays)}`
-    : ""
-  return `${decision.kept ? "kept" : `dropped (${decision.reason})`} · ${scores}${age}`
-}
 
 /** A result's age, in the largest unit that still reads precisely. */
 export function formatAge(days: number): string {
@@ -317,92 +307,281 @@ export function formatAge(days: number): string {
   return `${(whole / 365).toFixed(1)} years old`
 }
 
+/** Long names for the three checks that predate `checks.ts`. */
+const SCORE_LABELS: Record<string, string> = { relevant: "relevance" }
+
+/**
+ * Every score the gate recorded for one result.
+ *
+ * Driven by `decision.scores`, which holds exactly the checks that were asked:
+ * a check added to `checks.ts` shows up here with no change, and one disabled
+ * there stops being reported rather than reading as a flat 0.00. Decisions
+ * recorded before `scores` existed fall back to the three original fields.
+ */
+export function describeScores(decision: GateDecision): string {
+  const all = decision.scores
+  const entries =
+    all && typeof all === "object" && Object.keys(all).length > 0
+      ? Object.entries(all)
+      : ([
+          ["relevant", decision.relevant],
+          ["evidence", decision.evidence],
+          ["injection", decision.injection],
+        ] as [string, unknown][])
+  return entries.map(([id, value]) => `${SCORE_LABELS[id] ?? id} ${score(value)}`).join(" · ")
+}
+
+/** One row of the pipeline table. */
+export interface StageRow {
+  n: number
+  name: string
+  ms?: number
+  /** Items entering, absent for the first stage. */
+  from?: number
+  /** Items leaving. */
+  to: number
+  /** Characters of result text leaving this stage. */
+  chars?: number
+  /** What this stage did, in a few words. */
+  note: string
+  tokens?: number
+  failed?: string
+}
+
+/** Characters, abbreviated: 12318 -> "12.3k". */
+export function shortChars(n: unknown): string {
+  if (typeof n !== "number" || !Number.isFinite(n)) return "?"
+  return n < 1000 ? `${n}` : `${(n / 1000).toFixed(1)}k`
+}
+
+/** Milliseconds, abbreviated: 2438 -> "2.4s". */
+export function shortMs(n: unknown): string {
+  if (typeof n !== "number" || !Number.isFinite(n)) return "?"
+  return n < 1000 ? `${Math.round(n)}ms` : `${(n / 1000).toFixed(1)}s`
+}
+
+/**
+ * Group the gate's drops by the reason recorded against them.
+ *
+ * The reasons come from the check ids in `checks.ts`, so a check added there
+ * appears here as its own group with no change to this file.
+ */
+export function dropsByReason(decisions: readonly GateDecision[]): Array<[string, number]> {
+  const counts = new Map<string, number>()
+  for (const decision of decisions) {
+    if (decision.kept) continue
+    const reason = typeof decision.reason === "string" ? decision.reason : "dropped"
+    counts.set(reason, (counts.get(reason) ?? 0) + 1)
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1])
+}
+
+/**
+ * The stages that actually ran, in order.
+ *
+ * Built from what the trace contains, never from a fixed template: a disabled
+ * duplicate filter produces no duplicate row, a gate that never ran produces
+ * no gate row, and a stage that failed says so instead of showing a clean
+ * transition it did not make.
+ */
+export function stageRows(trace: SearchTrace): StageRow[] {
+  const sizes = trace.stages
+  const rows: StageRow[] = []
+  let n = 0
+  let carried = typeof sizes?.found?.items === "number" ? sizes.found.items : trace.found
+
+  rows.push({
+    n: ++n,
+    name: "search",
+    ms: trace.searchMs,
+    to: carried,
+    chars: sizes?.found?.chars,
+    note: `LangSearch returned ${carried} result${carried === 1 ? "" : "s"}${
+      typeof trace.freshness === "string" ? ` · freshness ${trace.freshness} (set by the model)` : ""
+    }`,
+  })
+
+  if (trace.dedupe) {
+    const dropped = list<NonNullable<SearchTrace["dedupe"]>["dropped"][number]>(trace.dedupe.dropped).length
+    const to = typeof sizes?.deduped?.items === "number" ? sizes.deduped.items : carried - dropped
+    rows.push({
+      n: ++n,
+      name: "duplicate filter",
+      from: carried,
+      to,
+      chars: sizes?.deduped?.chars,
+      note: dropped === 0 ? "no duplicates found" : `${dropped} redistributed cop${dropped === 1 ? "y" : "ies"} dropped`,
+    })
+    carried = to
+  }
+
+  if (trace.gate) {
+    const gate = trace.gate
+    const decisions = list<GateDecision>(gate.decisions)
+    const to = typeof sizes?.gated?.items === "number" ? sizes.gated.items : decisions.filter((d) => d.kept).length
+    const breakdown = dropsByReason(decisions)
+    rows.push({
+      n: ++n,
+      name: "jev gate",
+      ms: gate.durationMs,
+      from: carried,
+      to,
+      chars: sizes?.gated?.chars,
+      tokens: gate.usage?.inputTokens,
+      note: breakdown.length === 0 ? "nothing dropped" : breakdown.map(([r, c]) => `${c} ${r}`).join(" · "),
+      ...(gate.failed ? { failed: gate.failed } : {}),
+    })
+    if (!gate.failed) carried = to
+  }
+
+  if (trace.trim) {
+    const trim = trace.trim
+    const kept = typeof trim.passagesKept === "number" ? trim.passagesKept : 0
+    const total = typeof trim.passagesTotal === "number" ? trim.passagesTotal : 0
+    rows.push({
+      n: ++n,
+      name: "jev passage trim",
+      ms: trim.durationMs,
+      from: carried,
+      to: carried,
+      chars: typeof trim.charsAfter === "number" ? trim.charsAfter : undefined,
+      tokens: trim.usage?.inputTokens,
+      note: `${kept}/${total} passages kept · ${total - kept} dropped as boilerplate or off topic`,
+      ...(trim.failed ? { failed: trim.failed } : {}),
+    })
+  }
+
+  return rows
+}
+
+/** The pipeline table: what each stage received, did, and passed on. */
+export function renderPipeline(trace: SearchTrace): string[] {
+  const rows = stageRows(trace)
+  const lines = ["PIPELINE"]
+  const width = Math.max(...rows.map((row) => row.name.length))
+
+  for (const row of rows) {
+    const facts = [
+      row.from === undefined ? `${row.to} result${row.to === 1 ? "" : "s"}` : `${row.from} → ${row.to} results`,
+      ...(row.chars === undefined ? [] : [`${shortChars(row.chars)} chars`]),
+      ...(row.ms === undefined ? [] : [shortMs(row.ms)]),
+      ...(row.tokens === undefined ? [] : [`${row.tokens.toLocaleString()} jev tokens`]),
+    ]
+    lines.push(`  ${row.n}  ${row.name.padEnd(width)}   ${facts.join(" · ")}`)
+    lines.push(row.failed ? `       FAILED: ${row.failed} — results passed through unchanged` : `       ${row.note}`)
+  }
+
+  const first = trace.stages?.found
+  const last = trace.stages?.returned
+  if (first && last && typeof first.chars === "number" && typeof last.chars === "number" && first.chars > 0) {
+    const cut = Math.round((1 - last.chars / first.chars) * 100)
+    lines.push(
+      "",
+      `     ${first.items} results / ${shortChars(first.chars)} chars  →  ` +
+        `${last.items} results / ${shortChars(last.chars)} chars   (${cut}% less text reaches the model)`,
+    )
+  }
+  return lines
+}
+
 /** The full text shown when one search is opened. Exported for testing. */
 export function renderTrace(trace: SearchTrace): string {
   const lines: string[] = [
-    `Query: ${trace.query}`,
-    `Started: ${trace.startedAt}`,
-    `Search: ${trace.searchMs}ms · total ${trace.totalMs}ms`,
-    `Results: ${trace.found} found → ${trace.returned} returned`,
+    trace.query,
+    `${trace.startedAt} · ${shortMs(trace.totalMs)} end to end`,
+    "",
+    ...renderPipeline(trace),
   ]
 
   if (trace.dedupe) {
-    lines.push("", `Duplicate filter (containment >= ${trace.dedupe.minContainment})`)
     const dropped = list<NonNullable<SearchTrace["dedupe"]>["dropped"][number]>(trace.dedupe.dropped)
-    if (dropped.length === 0) lines.push("  nothing dropped")
-    for (const drop of dropped) {
-      const containment = typeof drop.containment === "number" ? ` ${drop.containment.toFixed(3)}` : ""
-      lines.push(`  ${drop.url}`, `    ${drop.reason} copy of result ${drop.duplicateOf}${containment}`)
+    if (dropped.length > 0) {
+      lines.push("", `DUPLICATES DROPPED   containment >= ${trace.dedupe.minContainment}`)
+      for (const drop of dropped) {
+        const containment = typeof drop.containment === "number" ? ` ${drop.containment.toFixed(2)}` : ""
+        lines.push(`  ${drop.url}`, `    ${drop.reason} copy of result ${drop.duplicateOf}${containment}`)
+      }
     }
   }
 
   if (trace.gate) {
     const gate = trace.gate
-    lines.push("", `Gate: ${gate.model} at ${gate.endpoint}`)
-    if (gate.failed) lines.push(`  FAILED: ${gate.failed}`, "  the unfiltered results were returned")
-    lines.push(
-      `  thresholds: relevance >= ${gate.thresholds.minRelevance} · ` +
-        `evidence >= ${gate.thresholds.minEvidence} · ` +
-        `injection <= ${gate.thresholds.maxInjection} · ` +
-        `at most ${gate.thresholds.maxResults}`,
-    )
-    if (typeof gate.thresholds.maxAgeDays === "number") {
-      lines.push(
-        `  recency: if the query needs current information (>= ${gate.thresholds.minTimely}), ` +
-          `drop results older than ${gate.thresholds.maxAgeDays} days`,
-      )
-    }
-    lines.push(`  ${gate.durationMs}ms · ${gate.usage.inputTokens ?? 0} input tokens`)
-    if (gate.timely !== undefined) {
-      const acted =
-        typeof gate.thresholds.minTimely === "number" && gate.timely >= gate.thresholds.minTimely
-          ? gate.staleDropped
-            ? ` (the query needs current information; ${gate.staleDropped} stale result(s) dropped)`
-            : " (the query needs current information; nothing was old enough to drop)"
-          : " (the answer does not go stale, so age was ignored)"
-      lines.push(`  timeliness: ${score(gate.timely)}${acted}`)
-    }
-    if (gate.disagreement !== undefined) {
-      lines.push(
-        `  disagreement: ${score(gate.disagreement)}` +
-          (gate.flagged ? " (the model was told the sources disagree)" : " (below the threshold)"),
-      )
-    }
-    for (const decision of list<GateDecision>(gate.decisions)) {
-      lines.push(`  ${decision.title ?? decision.url}`, `    ${decision.url}`, `    ${describeDecision(decision)}`)
-    }
-  }
+    const bounds: string[] = []
+    if (typeof gate.thresholds.minRelevance === "number") bounds.push(`relevance >= ${gate.thresholds.minRelevance}`)
+    if (typeof gate.thresholds.minEvidence === "number") bounds.push(`evidence >= ${gate.thresholds.minEvidence}`)
+    if (typeof gate.thresholds.maxInjection === "number") bounds.push(`injection <= ${gate.thresholds.maxInjection}`)
+    bounds.push(`at most ${gate.thresholds.maxResults}`)
+    lines.push("", `JEV GATE   ${bounds.join(" · ")}`)
+    lines.push(`  ${gate.model} at ${gate.endpoint}`)
+    if (gate.failed) lines.push(`  FAILED: ${gate.failed} — the unfiltered results were returned`)
 
-  if (trace.trim) {
-    const trim = trace.trim
-    lines.push("", `Passage trimming (keep above ${trim.threshold})`)
-    if (trim.failed) lines.push(`  FAILED: ${trim.failed}`, "  the untrimmed results were returned")
-    lines.push(
-      `  ${trim.passagesKept}/${trim.passagesTotal} passages kept · ` +
-        `${trim.charsBefore} → ${trim.charsAfter} chars · ` +
-        `${trim.durationMs}ms · ${trim.usage.inputTokens ?? 0} input tokens`,
-    )
+    const decisions = list<GateDecision>(gate.decisions)
+    const kept = decisions.filter((d) => d.kept)
+    const dropped = decisions.filter((d) => !d.kept)
+    if (kept.length > 0) {
+      lines.push("", `  KEPT (${kept.length})`)
+      for (const decision of kept) lines.push(...describeKept(decision))
+    }
+    if (dropped.length > 0) {
+      lines.push("", `  DROPPED (${dropped.length})`)
+      for (const decision of dropped) lines.push(...describeDropped(decision))
+    }
   }
 
   const questions = { ...(trace.gate?.questions ?? {}), ...(trace.trim?.questions ?? {}) }
-  // Written by the server half, but read here as opaque JSON.
   const names = Object.keys(questions)
   if (names.length > 0) {
-    lines.push("", "What jev was asked")
+    lines.push("", "WHAT JEV WAS ASKED")
     for (const name of names) {
       const question = questions[name]
       if (!question || typeof question.instructions !== "string") continue
-      lines.push(
-        `  ${name} (×${question.asked})`,
-        `    ${question.instructions}`,
-        `    true:  ${question.criteria?.true}`,
-        `    false: ${question.criteria?.false}`,
-      )
+      lines.push(`  ${name} ×${question.asked}`, `    ${question.instructions}`)
+      if (question.criteria) {
+        lines.push(`      yes: ${question.criteria.true}`, `      no:  ${question.criteria.false}`)
+      }
     }
   }
 
   return lines.join("\n")
 }
+
+/** Trim a title to one terminal line. */
+export function shortTitle(title: unknown, url: unknown, max = 72): string {
+  const text = typeof title === "string" && title.trim() ? title.trim() : typeof url === "string" ? url : "?"
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`
+}
+
+/** A kept result: title, where it came from, and every score behind it. */
+export function describeKept(decision: GateDecision): string[] {
+  return [
+    `    ${shortTitle(decision.title, decision.url)}`,
+    `      ${decision.url}`,
+    `      ${describeScores(decision)}${ageSuffix(decision)}`,
+  ]
+}
+
+/** A dropped result: one line, led by the reason it went. */
+export function describeDropped(decision: GateDecision): string[] {
+  const reason = typeof decision.reason === "string" ? decision.reason : "dropped"
+  return [
+    `    ${reason.padEnd(11)} ${shortTitle(decision.title, decision.url, 60)}`,
+    `      ${hostOf(decision.url)} · ${describeScores(decision)}${ageSuffix(decision)}`,
+  ]
+}
+
+/** The host part of a URL, for the compact dropped list. */
+export function hostOf(url: unknown): string {
+  if (typeof url !== "string") return "?"
+  const match = /^https?:\/\/([^/?#]+)/i.exec(url)
+  return match?.[1]?.replace(/^www\./, "") ?? url
+}
+
+function ageSuffix(decision: GateDecision): string {
+  return typeof decision.ageDays === "number" && Number.isFinite(decision.ageDays)
+    ? ` · ${formatAge(decision.ageDays)}`
+    : ""
+}
+
 
 /**
  * What the trace viewer draws: the query as the heading and the rendered trace

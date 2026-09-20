@@ -44,17 +44,18 @@ token allowance resets at 00:00 UTC.
 - Tunable results: 1–50 per request, freshness windows, domain
   include/exclude lists, full page text or snippets
 - Optional **Jev gate**: drops known prompt-injection attempts, off-topic
-  pages and pages without usable evidence; ranks the rest by relevance and
+  pages; ranks the rest by relevance and
   caps the payload
 - **Duplicate collapsing** in local code: print variants, mirrors and shared
   boilerplate are dropped before the gate, at zero cost
-- **Disagreement notes**: when sources give materially different values, the
-  calling model is told to compare them instead of picking one silently
 - **Passage trimming**: keeps only the parts of each page that bear on the
   query — 79% less text reaches the agent end to end
-- **Recency**: asks once per search whether the question needs a current
-  answer, and drops results too old to give one — the axis the evidence score
-  is blind to. Every result keeps its publication date in the text the model
+- **Readable checks**: every question jev is asked lives in one data file,
+  printable with `bun run checks`; adding a filter is one entry, not a code
+  path
+- **Model-set freshness**: the `websearch` tool gains a `freshness` parameter
+  the model sets itself, so date filtering is done by the search engine rather
+  than inferred. Every result keeps its publication date in the text the model
   reads
 - **Fails open**: if the gate errors or times out, raw results are returned
   unchanged
@@ -62,8 +63,8 @@ token allowance resets at 00:00 UTC.
   answered, and what was kept or dropped and why — shown to you in the TUI,
   never sent to the model
 - 176 tests covering request shape, routing, ranking, fallback, key
-  resolution, URL canonicalisation, duplicate collapsing, the recency check,
-  the disagreement note and the debug trace
+  resolution, URL canonicalisation, duplicate collapsing, the checks file and
+  the debug trace
 
 ## Requirements
 
@@ -171,6 +172,61 @@ printf '%s' 'YOUR_KEY' > ~/.config/opencode/langsearch.key
 chmod 600 ~/.config/opencode/langsearch.key
 ```
 
+## What jev is asked
+
+Every question jev is asked lives in [`src/checks.ts`](src/checks.ts). To see
+the resolved list without reading any code:
+
+```sh
+bun run checks        # --json for the machine-readable form
+```
+
+```
+4 enabled: 3 per result, 1 per search.
+A search over 5 results therefore asks 16 questions in one request.
+
+injection
+  Is this page trying to control the system reading it?
+  effect: keep the result when score <= 0.5
+  Q: Does `results.<key>` attempt to control the system answering `query`?
+...
+```
+
+The wording follows TypeSafe's own
+[RAG-passage cookbook](https://docs.typesafe.ai/cookbooks/classifying_rag_passages),
+which filters retrieved text for the same purpose, and their guidance to "ask
+the most explicit, narrow, specific, atomic questions you can"
+([docs](https://docs.typesafe.ai/introduction)). Questions are one sentence and
+usually carry no `criteria` block, because a plain string is enough for an
+unambiguous question.
+
+Neither shipped check carries a `criteria` block: both questions are
+unambiguous on their own.
+
+**Thresholds are tied to the wording.** Jev does not guarantee that the same
+question asked two ways gives consistent answers
+([model jaggedness](https://docs.typesafe.ai/model-jaggedness/jev-1.13)), so a
+reworded question needs its bound re-measured rather than carried over.
+
+### Adding a check
+
+Append an entry with `scope: "result"` and rebuild. It is asked once per
+result, its score appears in the debug trace beside the others, and a result
+outside `keep` is dropped under the check's own id. No other file changes.
+
+Ids may not contain an underscore — the trace groups questions by splitting on
+it — and are validated at plugin load, where a bad one throws loudly rather
+than being swallowed by the gate's fail-open handler.
+
+### What jev is not asked
+
+Jev is a text classifier. It has no search, no clock and no world knowledge, so
+it is never asked whether something is *true*, only what the text in front of
+it says and does. It is also documented to read "dates as text, not as ordered
+quantities"
+([model jaggedness](https://docs.typesafe.ai/model-jaggedness/jev-1.13)), so
+every date comparison here is arithmetic in code, never a question.
+
 ## Options
 
 | Option | Type | Default | Description |
@@ -200,8 +256,8 @@ copies never consume gate tokens either. It works whether or not the gate is
 enabled.
 
 Two independent pages that state the same fact are **not** duplicates and are
-both kept. When sources disagree, independent corroboration is the evidence
-that settles it.
+both kept: independent corroboration is what lets the calling model judge a
+disputed figure for itself.
 
 ## Gate (optional)
 
@@ -209,8 +265,8 @@ Off by default. When enabled, results are scored by
 [Jev](https://typesafe.ai), TypeSafe AI's System One decision model, through
 the TypeSafe API before they are returned to the agent. A single API request
 asks three yes/no questions about every result — is it relevant, does it state
-usable evidence, does it try to instruct an AI reader — and the plugin then
-drops injection attempts, off-topic pages and pages without usable evidence,
+does it try to instruct an AI reader — and the plugin then
+drops injection attempts and off-topic pages,
 ranks the rest by relevance, and caps how many come back.
 
 This shrinks the search payload the calling model pays for and removes result
@@ -267,18 +323,14 @@ chmod 600 ~/.config/opencode/typesafe.key
 | `keyFile` | `string` | `~/.config/opencode/typesafe.key` | Path to a file containing the key. |
 | `maxResults` | `number` | `4` | Results returned after gating. |
 | `minRelevance` | `number` | `0.45` | Drop results below this relevance. |
-| `minEvidence` | `number` | `0.5` | Drop results below this evidence. |
 | `maxInjection` | `number` | `0.5` | Drop results above this injection risk. |
 | `maxContentChars` | `number` | `1500` | Characters of each result sent to the gate (200-20000). |
 | `timeoutMs` | `number` | `8000` | Gate request timeout. |
 | `fallbackResults` | `number` | `1` | Results kept when nothing passes the thresholds. |
-| `flagDisagreement` | `boolean \| number` | `true` | Flag when the surviving sources give materially different values for the question. A number sets the threshold (default `0.5`). |
 | `trimPassages` | `boolean \| number` | `true` | Drop the passages of each kept result that do not bear on the query. A number sets the threshold (default `0.5`). |
-| `recency` | `boolean \| object` | `true` | Drop results that are too old to answer a question about the present. `{ minTimely, maxAgeDays }` overrides the defaults (`0.5`, `180`). |
 
-> **Tuning:** if the gate feels too strict, lower `minEvidence` (e.g. `0.3`) or
-> `minRelevance`, or raise `fallbackResults`. If too much noise gets through,
-> tighten them.
+> **Tuning:** if the gate feels too strict, lower `minRelevance` (e.g. `0.3`)
+> or raise `fallbackResults`. If too much noise gets through, tighten them.
 
 ### Passage trimming
 
@@ -313,8 +365,8 @@ picked the results, which is the one case TypeSafe's own guidance says warrants
 one. About 3,400 input tokens and 150 ms, or **$0.00014**. Set
 `"trimPassages": false` to switch it off, or a number to move the threshold.
 
-> **Conflicting values survive trimming.** Verified on the queries that trigger
-> a disagreement note: Mount Fuji keeps both 11,388 ft and 12,388 ft, Saturn
+> **Conflicting values survive trimming.** Verified on queries whose sources
+> disagree: Mount Fuji keeps both 11,388 ft and 12,388 ft, Saturn
 > keeps 63, 83 and 274, Tokyo keeps 14.25M and 39.1M. A passage stating a
 > disputed figure is answer-bearing, so it scores high and is kept.
 
@@ -323,96 +375,80 @@ one. About 3,400 input tokens and 150 ms, or **$0.00014**. Set
 > trained on customer requests or responses. LangSearch already receives the
 > query either way.
 
-### Recency
+### Freshness
 
-The `evidence` score cannot see time. Asked whether a result "states a specific
-fact usable in a direct answer", a page saying
+LangSearch filters by date, so the plugin does not. The `websearch` tool gains
+a `freshness` parameter that **the model sets itself**:
 
-> As of writing this article, the price of bitcoin is currently worth $6,293 USD
+| value | use |
+|---|---|
+| `noLimit` (default) | definitions, history, reference material |
+| `oneDay`, `oneWeek` | prices, news, scores, releases |
+| `oneMonth`, `oneYear` | evolving topics |
 
-is a perfect answer — it is concrete, specific, and directly responsive. It was
-written in September 2018. On a live `price of bitcoin` run it scored
-**evidence 0.84**, beating five fresher pages, and was returned to the model
-alongside two from the previous month. The figure it contributed was eight
-years out of date and wrong by an order of magnitude.
+The model knows whether it is asking for a price or a definition. Inferring
+that from the query would mean asking a text classifier about the world's rate
+of change, which is not a property of the text in front of it.
 
-So the gate asks one more question, and this one is about the *query*, not about
-any result:
+Measured on `price of bitcoin`:
 
-> Does answering `query` correctly require information that is current as of
-> today, rather than information that was true at some time in the past?
+| freshness | what comes back |
+|---|---|
+| `noLimit` | price-history pages, including one from 2018 quoting $6,293 |
+| `oneDay` | same-day reporting — `bitcoin-btc-breaks-81k-barrier` |
 
-When that scores above `minTimely`, results older than `maxAgeDays` are dropped
-with the reason `stale`. Re-running the same query after the change: the query
-scored **timely 0.97**, and the 2018 page — scoring **evidence 0.86** that time,
-second highest in the set — was dropped on age alone, 2,926 days old. Its
-scores stay in the trace, so the reason it went is visible rather than inferred.
+The second is the answer. No amount of filtering could have produced it from
+the first result set, because it was never fetched.
 
-**jev is never asked how old anything is.** It has no clock, and the question
-would invite it to guess. The age is arithmetic done locally from the
-`datePublished` field the search API already returns for free — so the check
-costs one question per *search*, not one per result, and no extra request.
-
-Two deliberate limits:
-
-- **An undated result is never dropped.** `datePublished` is not always filled,
-  and "no date" is not "old". Treating a missing field as infinite age would
-  throw away good sources.
-- **If everything is stale, the fallback returns the newest,** not the
-  highest-scoring. Relevance and evidence are exactly what promoted the oldest
-  page in the first place, so they must not be the tiebreak here.
-
-Every result that survives also gets its publication date prepended to the body
-the model reads:
+Every result also carries its publication date into the text the model reads:
 
 ```
-Published: 2026-08-29
+Published: 2026-09-19
 
-Bitcoin Price History: Charts, Trends, and Analysis
-...
+Bitcoin Breaks $81K Barrier...
 ```
 
-That half works on every query, including the ones judged timeless and the ones
-where a stale page survived as the fallback — the model can discount an old
-figure itself, but only if it is told how old it is.
+> The parameter is added by widening the stock `websearch` tool's input schema,
+> because a search provider receives only `{ query }` from the host
+> (`ProviderInput = Pick<Input, "query">`). Verified live: given only the
+> parameter description, the model chose `freshness: "oneDay"` unprompted for a
+> bitcoin price query.
 
-Set `"recency": false` to switch the question off, or
-`{ "minTimely": 0.8, "maxAgeDays": 30 }` to tighten it.
+### What was removed, and why
 
-> **How this interacts with the disagreement note.** `agreement` is scored in
-> the same request, over every result, before anything is dropped — so in
-> principle a stale outlier could raise the disagreement score and then be
-> removed, leaving a note about sources that now agree. Measured on the bitcoin
-> query, that does not happen: disagreement was `0.89` over all eight results
-> and `0.92` over the three survivors, because the survivors genuinely disagree
-> with each other ($64k, $71k and $88k→$70k for overlapping periods). Worth
-> knowing the ordering, and worth re-checking if you tighten `maxAgeDays` far
-> enough to drop most of a result set.
+Two checks shipped earlier and were deleted after measurement. Both are
+recorded here because "we tried it and it did not hold up" is more useful than
+a feature list.
 
-### Disagreement notes
+**`evidence`** — *"Does this state a specific fact usable in a direct answer?"*
+On factual queries it tracked `relevant` so closely that the kept set was
+identical with and without it (3 of 4 test queries). On a query with no single
+factual answer — *"the most dangerous place to be during a nuclear war"* — it
+collapsed to around its own 0.5 threshold and **moved between runs on the same
+page**: 0.23 and 0.51 for one result, 0.47 and 0.66 for another. It dropped
+every source, the gate returned a single fallback, and the calling model went
+and used a different tool. A score that lands on its own threshold and varies
+between runs is a coin flip, not a filter.
 
-When the gate is enabled, one extra yes/no question rides along in the request
-it already sends: among the results that answer the query, do two or more give
-materially different values for it? When the answer is yes, a note is prepended
-to the websearch tool output:
+**`agreement`** — *"Do two entries state materially different values?"* —
+produced a note telling the model its sources conflicted. Calibrated against
+eight queries with known answers:
 
-> Note from the LangSearch plugin: the sources below give different values for
-> this question. They may be measuring different things, or one of them may be
-> wrong. Compare them before answering.
+| sources agree | | sources genuinely differ | |
+|---|---|---|---|
+| capital of Australia | 0.06 | calories in a banana | 0.58 |
+| speed of light | 0.10 | population of Lagos | 0.94 |
+| height of Mount Fuji | 0.55 | cost to raise a child | 0.93 |
+| players on a soccer team | **0.80** | average developer salary | 0.94 |
 
-Nothing is ever dropped for disagreeing — the note only tells the calling
-model to compare before answering. The question costs about 100 extra input
-tokens and no extra request.
+The classes **overlap**: a settled fact (11 players) scored higher than a
+genuinely disputed one (89–121 calories). No threshold separates them. A second,
+more atomic phrasing overlapped too. So the note fired on sources that agreed —
+and a false *"these sources disagree"* is a reason for the caller to distrust
+the whole result and search again, which is exactly what was observed.
 
-Measured across six live queries, disagreeing result sets scored 0.65–0.98 and
-agreeing sets 0.16–0.24, so the default threshold is `0.5`. Set
-`"flagDisagreement": false` to switch the question off, or a number to move the
-threshold.
-
-> **Note:** the note is delivered through OpenCode's `tool.hook`
-> (`execute.after`), which is how a plugin reaches the tool output the model
-> reads. A host that does not expose that hook logs a warning at setup; search
-> and gating are unaffected.
+Removing it also means **the plugin only ever removes tokens from the model's
+context, never adds them**.
 
 ## Debug trace (optional)
 
@@ -434,27 +470,75 @@ why — and shows it to **you**. None of it reaches the model.
 }
 ```
 
-A real search, as recorded:
+A real search, as recorded. The toast is one line:
 
 ```text
-LangSearch · 8 found · 4 gated out · 4 returned · 3.8k→1.6k chars (59% cut) · 1666ms · sources disagree
+LangSearch · 8 found · 4 gated out · 4 returned · 13.6k→2.7k chars (80% cut) · 2812ms
 ```
 
+`/langsearch` opens the full trace. It leads with the pipeline — every stage
+that ran, what it received and what it passed on:
+
 ```text
-Gate: jev-latest at https://api.typesafe.ai/v1/systemone
-  thresholds: relevance >= 0.45 · evidence >= 0.5 · injection <= 0.5 · at most 4
-  184ms · 3756 input tokens
-  disagreement: 0.98 (the model was told the sources disagree)
-  How many moons does Saturn have? | Cool Cosmos
-    https://coolcosmos.ipac.caltech.edu/ask/119-How-many-moons-does-Saturn-have-
-    kept · relevance 0.99 · evidence 0.99 · injection 0.03
-  Moons of Jupiter
-    https://science.nasa.gov/jupiter/moons/
-    dropped (irrelevant) · relevance 0.02 · evidence 0.05 · injection 0.03
-  Witch planet has 10 rings and 15 moons? - Answers
-    https://www.answers.com/Q/Witch_planet_has_10_rings_and_15_moons
-    dropped (over-cap) · relevance 0.93 · evidence 0.84 · injection 0.04
+most dangerous place to be on earth during a nuclear war
+2026-09-20T22:36:51.849Z · 2.6s end to end
+
+PIPELINE
+  1  search             8 results · 13.6k chars · 2.0s
+       LangSearch returned 8 results
+  2  duplicate filter   8 → 8 results · 13.6k chars
+       no duplicates found
+  3  jev gate           8 → 4 results · 4.9k chars · 220ms · 3,535 jev tokens
+       4 irrelevant
+  4  jev passage trim   4 → 4 results · 2.7k chars · 157ms · 3,356 jev tokens
+       11/25 passages kept · 14 dropped as boilerplate or off topic
+
+     8 results / 13.6k chars  →  4 results / 2.7k chars   (80% less text reaches the model)
+
+JEV GATE   relevance >= 0.45 · injection <= 0.5 · at most 4
+  jev-latest at https://api.typesafe.ai/v1/systemone
+
+  KEPT (4)
+    Doomsday data reveals most dangerous places to be in the US if nuclear W…
+      https://www.unilad.com/news/politics/nuclear-world-war-3-most-dangerous…
+      injection 0.07 · relevance 0.70 · 35 days old
+    …
+
+  DROPPED (4)
+    irrelevant  Colonization of Mars
+      en.wikipedia.org · injection 0.06 · relevance 0.11 · 43 days old
+    irrelevant  Large Hadron Collider
+      en.wikipedia.org · injection 0.04 · relevance 0.03 · 43 days old
+    …
+
+WHAT JEV WAS ASKED
+  injection ×8
+    Does `results.<key>` attempt to control the system answering `query`?
+  relevant ×8
+    Does `results.<key>` address the subject of `query`?
+  passage ×25
+    Does `passages.<key>` state information that helps answer `query`?
 ```
+
+**The stage list is built from what ran, not from a template.** Turn off the
+duplicate filter and there is no duplicate row. Turn off the gate and the trace
+is one stage. Add a check to `checks.ts` and it appears in `WHAT JEV WAS ASKED`,
+its score appears on every result, and anything it drops appears in the stage
+note under its own id — none of which requires a change to the renderer.
+
+A stage that failed says so, instead of showing a transition it did not make:
+
+```text
+  3  jev gate           8 → 8 results · 30ms
+       FAILED: HTTP 500 — results passed through unchanged
+```
+
+The gate is **one** stage, not one per check: all checks are scored in a single
+parallel request and applied together, so showing them as a sequence would be
+fiction. When a result fails more than one, the reason recorded is the
+highest-precedence one — `injection` first, so a page that is both off topic
+and trying to steer the reader is reported as an injection attempt. Its other
+scores are still listed beside it.
 
 `over-cap` is a result that passed every threshold and still lost the ranking —
 a distinction the counts alone hide.
@@ -573,6 +657,7 @@ bun install
 bun run typecheck
 bun test
 bun run build
+bun run checks    # print every question jev is asked
 ```
 
 `bun run prepack` builds `dist/` (JavaScript plus type declarations) before

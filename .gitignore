@@ -5,6 +5,8 @@ dist/
 .env
 .env.*
 
+CLAUDE.local.md
+
 # Personal strategy notes — never committed
 /note.md
 
