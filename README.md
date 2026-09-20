@@ -1,7 +1,15 @@
-# @jamubc/opencode-langsearch
+# @jamubc/opencode-langsearch-jev
 
 [![CI](https://github.com/jamubc/opencode-langsearch/actions/workflows/ci.yml/badge.svg)](https://github.com/jamubc/opencode-langsearch/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
+> **Status: work in progress.** This plugin, and Jev's use inside it, is still
+> being tuned. A separate tool,
+> [langsearch-JEV-experimentation-interface](https://github.com/jamubc/langsearch-JEV-experimentation-interface),
+> was built to support that tuning. It exists to answer one question: can Jev
+> be used to make LangSearch's results better and cheaper, fewer tokens spent
+> per search, better results returned, so that web searches run by an LLM are
+> more optimized?
 
 An **unofficial** [OpenCode](https://opencode.ai) plugin that adds
 [LangSearch](https://langsearch.com) as a web search provider, and optionally
