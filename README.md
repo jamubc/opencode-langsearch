@@ -1,4 +1,8 @@
-# @jamubc/opencode-langsearch-jev
+# @jamubc/opencode-langsearch (with jev)
+
+<img width="276" height="52" alt="image" src="https://github.com/user-attachments/assets/1d222095-a800-41f9-8766-5202da490c10" />
+<img width="540" height="95" alt="image" src="https://github.com/user-attachments/assets/20b1070e-638a-4595-ac84-cc2d9b550db0" />
+
 
 [![CI](https://github.com/jamubc/opencode-langsearch/actions/workflows/ci.yml/badge.svg)](https://github.com/jamubc/opencode-langsearch/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
